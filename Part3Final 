@@ -1,0 +1,209 @@
+import torch, os
+import torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+from torchvision.utils import save_image
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+
+#for rangpur
+directory = 'generated_images'
+
+#for local machine
+#directory = 'generated_images'
+os.makedirs(directory, exist_ok=True)
+
+#hyper parameters 
+image_size = 64 #images are 64 by 64
+batch_size = 128 
+learning_rate = 0.00025 # learning rate that is found to be optimal for this dataset
+epochs = 75
+latent_size = 128 # picked for mix of performance to quality
+
+
+
+#Normalise the data nad make images 64 x 64
+transform_train = transforms.Compose([transforms.Resize(64),
+                               transforms.CenterCrop(64),
+                               transforms.ToTensor(),
+                               transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+
+
+# no testing set needed
+trainset = torchvision.datasets.CelebA(root='./data',
+                                        download=True, transform=transform_train)
+
+
+train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
+                                          shuffle=True)
+
+
+
+#discriminator for classifying the images made by the generator
+# optimal values for discriminator chosen
+class Discriminator(nn.Module):
+    def _init_(self):
+        super(Discriminator, self)._init_()
+
+        self.discriminator = nn.Sequential(
+            # 3x 64 x 64
+            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 64 x 32 x 32
+
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 128 x 16 x 16
+
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 256 x 8 x 8
+
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            # 512 x 4 x 4
+
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0, bias=False),
+            # 1 x 1 x 1
+
+            nn.Flatten(),
+            nn.Sigmoid()
+            #sigmoid used to classify yes and no
+        )
+        
+    def forward(self, image):
+        return self.discriminator(image)
+
+
+class Generator(nn.Module):
+    def _init_(self):
+        super(Generator, self)._init_()
+        self.generator = nn.Sequential(
+            # latent_size (128) x 1 x 1
+
+            nn.ConvTranspose2d(latent_size, 512, kernel_size=4, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True),
+            # 512 x 4 x 4
+
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True),
+            # 256 x 8 x 8
+
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            # 128 x 16 x 16
+
+            nn.ConvTranspose2d(128, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            # 32 x 32 x 32 changed to learn a greater variety instead of dropping from 64 x 32 x 32 to get better range of features in upsampling 
+
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Tanh()  # output is between -1 to 1
+            # 3 x 64 x 64
+    )
+    
+    def forward(self, latent):
+        return self.generator(latent)
+
+#instantiate the models
+gen = Generator()
+dis = Discriminator()
+gen.to(device)
+dis.to(device)
+
+
+#generates the latent vector for the generator
+sample = torch.randn(batch_size, latent_size, 1, 1, device=device) 
+#prints a sample gan output shape
+gan_output = gen(sample)
+print(gan_output.shape)
+
+#binary cross entropy loss used as discriminator dishes binary output
+criterion = nn.BCELoss()
+#adam optimiser chosen for simplicity and dynamic learning rate
+optimizerD = torch.optim.Adam(dis.discriminator.parameters(), lr=learning_rate)
+optimizerG = torch.optim.Adam(gen.generator.parameters(), lr=learning_rate)
+
+
+def train_generator(opt_g):
+    # Clear generator gradients
+    opt_g.zero_grad()
+
+    # Generate fake images
+    latent = torch.randn(batch_size, latent_size, 1,1, device=device)
+    fake_images = gen(latent)
+
+    # Try to fool the discriminator
+    preds = dis(fake_images)
+    targets = torch.ones(batch_size, 1, device=device)
+    loss = F.binary_cross_entropy(preds, targets)
+
+    # Update generator 
+    loss.backward()
+    opt_g.step()
+
+    return loss.item()
+
+def train_discriminator(real_images, opt_d):
+    # Clear discriminator gradients
+    opt_d.zero_grad()
+
+    # Pass real images through  discriminator
+    real_preds = dis(real_images)
+    real_targets = torch.ones(real_images.size(0), 1, device=device)
+    real_loss = F.binary_cross_entropy(real_preds, real_targets)
+    real_score = torch.mean(real_preds).item()
+
+    # Generate fake images
+    latent = torch.randn(batch_size, latent_size, 1, 1, device=device)
+    fake_images = gen(latent)
+
+    # Pass Fake images through discriminator
+    fake_targets = torch.zeros(fake_images.size(0), 1, device=device)
+    fake_preds = dis(fake_images)
+    fake_loss = F.binary_cross_entropy(fake_preds, fake_targets)
+    fake_score = torch.mean(fake_preds).item()
+
+    # Update discriminator weights
+    loss = real_loss + fake_loss
+    loss.backward()
+    opt_d.step()
+    return loss.item()
+
+    
+fixed_latent = torch.randn(64, latent_size, 1, 1, device=device)
+
+
+for epoch in range (epochs):
+    for batch, _ in train_loader:
+        batch = batch.to(device)
+        
+        loss_d = train_discriminator(batch, optimizerD)
+        loss_g = train_generator(optimizerG)
+    
+    fake_images = gen(fixed_latent)
+    fake_fname = 'generated=images-{0:0=4d}.png'.format(epoch)
+    
+    #denormalise the image by multiplying the same mean and variance applied at start
+    denormalised_image = fake_images*0.5 + 0.5
+    #save to computer
+    save_image(denormalised_image, os.path.join(directory, fake_fname), nrow=8)
+    print("Saving", fake_fname)
+
+
+
+'''
+" PyTorch DCGAN Faces tutorial on PyTorch's official website (source: https://pytorch.org/tutorials/beginner/dcgan_faces_tutorial.html)"
+" Kaggle tutorial on GANs by Sushant097 (source: https://www.kaggle.com/code/sushant097/gan-beginner-tutorial-on-celeba-dataset)"
+" Run.ai's PyTorch GAN tutorial for computer vision (source: https://www.run.ai/guides/deep-learning-for-computer-vision/pytorch-gan)"
+'''
